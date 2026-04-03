@@ -58,6 +58,10 @@ pub struct TransactionInfo {
     pub read_version: Option<i64>,
     /// Transaction commit version
     pub commit_version: Option<i64>,
+    /// Full 10-byte versionstamp (committed_version + batch_order).
+    /// Unlike `commit_version`, the batch_order distinguishes transactions
+    /// that committed in the same FDB batch.
+    pub versionstamp: Option<[u8; 10]>,
 }
 
 /// Data structure containing the actual metrics for a transaction,
@@ -94,6 +98,11 @@ impl MetricsReport {
     /// * `version` - The commit version
     pub fn set_commit_version(&mut self, version: i64) {
         self.transaction.commit_version = Some(version);
+    }
+
+    /// Set the full 10-byte versionstamp for the transaction
+    pub fn set_versionstamp(&mut self, vs: [u8; 10]) {
+        self.transaction.versionstamp = Some(vs);
     }
 
     /// Increment the retry counter
@@ -193,6 +202,15 @@ impl TransactionMetrics {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         data.set_commit_version(version);
+    }
+
+    /// Set the full 10-byte versionstamp for the transaction
+    pub fn set_versionstamp(&self, vs: [u8; 10]) {
+        let mut data = self
+            .metrics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        data.set_versionstamp(vs);
     }
 
     /// Resets the current metrics and increments the retry counter in total metrics.
