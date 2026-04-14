@@ -71,6 +71,22 @@ pub trait RunnerHooks {
     /// Called after successful commit with the committed transaction and commit duration.
     fn on_commit_success(&self, _committed: &TransactionCommitted, _commit_duration_ms: u64) {}
 
+    /// Returns `true` if the hook wants the runner to resolve the versionstamp
+    /// future after a successful commit. When `false` (the default), the runner
+    /// skips `get_versionstamp()` entirely — avoiding unnecessary FDB work for
+    /// hooks that don't need it.
+    fn wants_versionstamp(&self) -> bool {
+        false
+    }
+
+    /// Called with the full 10-byte versionstamp after successful commit.
+    /// The versionstamp includes both `committed_version` (8 bytes) and
+    /// `batch_order` (2 bytes), providing a unique identifier for each
+    /// transaction within a commit batch.
+    ///
+    /// Only called when [`wants_versionstamp`](RunnerHooks::wants_versionstamp) returns `true`.
+    fn on_versionstamp(&self, _vs: [u8; 10]) {}
+
     /// Called before the next retry iteration (after `on_error` succeeds).
     fn on_retry(&self) {}
 
@@ -118,6 +134,14 @@ impl RunnerHooks for InstrumentedHooks {
         }
     }
 
+    fn wants_versionstamp(&self) -> bool {
+        true
+    }
+
+    fn on_versionstamp(&self, vs: [u8; 10]) {
+        self.metrics.set_versionstamp(vs);
+    }
+
     fn on_retry(&self) {
         self.metrics.reset_current();
     }
@@ -137,7 +161,7 @@ impl RunnerHooks for InstrumentedHooks {
 /// 2. If closure returns `Err` with an `FdbError`:
 ///    - `on_closure_error` → `on_error()` → `on_error_duration` → `on_retry` → loop
 /// 3. If closure succeeds, attempt commit:
-///    - Commit succeeds → `on_commit_success` → return `Ok`
+///    - Commit succeeds → `on_commit_success` → (if `wants_versionstamp`) `on_versionstamp` → return `Ok`
 ///    - Commit fails (retryable) → `on_commit_error` → `on_error()` → `on_error_duration` → `on_retry` → loop
 ///    - Commit fails (non-retryable) → return `Err`
 #[cfg_attr(
@@ -200,6 +224,13 @@ where
         #[cfg(feature = "trace")]
         tracing::info!(iteration, "closure executed, checking result...");
 
+        // The FDB C API requires fdb_transaction_get_versionstamp to be called
+        // BEFORE commit; the returned future resolves once commit succeeds.
+        // Only create it when the hooks actually need the versionstamp.
+        let vs_future = hooks
+            .wants_versionstamp()
+            .then(|| transaction.get_versionstamp());
+
         let now_commit = Instant::now();
         let commit_result = transaction.commit().await;
         let commit_duration = now_commit.elapsed().as_millis() as u64;
@@ -215,6 +246,18 @@ where
             }
             Ok(Ok(committed)) => {
                 hooks.on_commit_success(&committed, commit_duration);
+
+                // Resolve the versionstamp future that was created before commit.
+                // Read-only transactions will error here — that's expected and harmless.
+                if let Some(vs_fut) = vs_future {
+                    if let Ok(vs_slice) = vs_fut.await {
+                        if vs_slice.len() >= 10 {
+                            let mut vs = [0u8; 10];
+                            vs.copy_from_slice(&vs_slice[..10]);
+                            hooks.on_versionstamp(vs);
+                        }
+                    }
+                }
 
                 #[cfg(feature = "trace")]
                 tracing::info!(iteration, "success, returning result");

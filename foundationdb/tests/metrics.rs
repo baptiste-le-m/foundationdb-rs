@@ -337,6 +337,13 @@ async fn test_transaction_info() -> FdbResult<()> {
 
         // Commit version should be set (we don't know the exact value)
         assert!(transaction_info.commit_version.is_some());
+        // Versionstamp should be set for write transactions
+        assert!(
+            transaction_info.versionstamp.is_some(),
+            "write transaction should have a versionstamp"
+        );
+        let vs = transaction_info.versionstamp.unwrap();
+        assert_ne!(vs, [0u8; 10], "versionstamp should be non-zero");
     }
 
     // Test retries field

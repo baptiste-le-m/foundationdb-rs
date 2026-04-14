@@ -2,9 +2,7 @@ use foundationdb::*;
 #[allow(unused_imports)]
 use foundationdb_macros::cfg_api_versions;
 use foundationdb_sys::if_cfg_api_versions;
-#[allow(unused_imports)]
-use std::sync::atomic::{AtomicU64, Ordering};
-#[allow(unused_imports)]
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 mod common;
@@ -13,6 +11,10 @@ mod common;
 fn test_runner_hooks() {
     let _guard = unsafe { foundationdb::boot() };
     futures::executor::block_on(test_happy_path_instrumented()).expect("failed to run");
+    futures::executor::block_on(test_versionstamp_direct_api()).expect("failed to run");
+    futures::executor::block_on(test_versionstamp_not_resolved_when_not_wanted())
+        .expect("failed to run");
+    futures::executor::block_on(test_versionstamp_resolved_when_wanted()).expect("failed to run");
     // ReportConflictingKeys (option 712) requires FDB >= 6.3
     if_cfg_api_versions!(min = 630 => {
         futures::executor::block_on(test_conflict_reports_in_metrics()).expect("failed to run");
@@ -35,6 +37,12 @@ async fn test_happy_path_instrumented() -> FdbResult<()> {
     assert_eq!(result, 42);
     assert_eq!(metrics.transaction.retries, 0);
     assert!(metrics.conflicting_keys.is_empty());
+    assert!(
+        metrics.transaction.versionstamp.is_some(),
+        "write transaction should have a versionstamp"
+    );
+    let vs = metrics.transaction.versionstamp.unwrap();
+    assert_ne!(vs, [0u8; 10], "versionstamp should be non-zero");
 
     Ok(())
 }
@@ -140,6 +148,100 @@ async fn test_conflict_keys_direct_api() -> FdbResult<()> {
             assert!(has_our_key, "conflicting range should contain our key");
         }
     }
+
+    Ok(())
+}
+
+/// Direct API: call get_versionstamp() before commit, await after commit succeeds.
+async fn test_versionstamp_direct_api() -> FdbResult<()> {
+    let db = common::database().await?;
+
+    let trx = db.create_trx()?;
+    trx.set(b"test_versionstamp_direct", b"value");
+    // The FDB C API requires get_versionstamp to be called BEFORE commit.
+    let vs_future = trx.get_versionstamp();
+    trx.commit().await?;
+
+    let vs_slice = vs_future
+        .await
+        .expect("get_versionstamp should succeed for write transaction");
+    assert_eq!(
+        vs_slice.len(),
+        10,
+        "versionstamp should be exactly 10 bytes"
+    );
+    assert_ne!(&vs_slice[..], &[0u8; 10], "versionstamp should be non-zero");
+
+    Ok(())
+}
+
+/// A test-only RunnerHooks implementation that tracks whether on_versionstamp was called.
+struct SpyHooks {
+    /// Controls whether the hook opts-in to versionstamp resolution.
+    wants_vs: bool,
+    /// Set to true when on_versionstamp is called.
+    versionstamp_called: Arc<AtomicBool>,
+}
+
+impl SpyHooks {
+    fn new(wants_vs: bool) -> Self {
+        Self {
+            wants_vs,
+            versionstamp_called: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn was_versionstamp_called(&self) -> bool {
+        self.versionstamp_called.load(Ordering::SeqCst)
+    }
+}
+
+impl RunnerHooks for SpyHooks {
+    fn wants_versionstamp(&self) -> bool {
+        self.wants_vs
+    }
+
+    fn on_versionstamp(&self, _vs: [u8; 10]) {
+        self.versionstamp_called.store(true, Ordering::SeqCst);
+    }
+}
+
+/// When wants_versionstamp() returns false, on_versionstamp must NOT be called.
+async fn test_versionstamp_not_resolved_when_not_wanted() -> FdbResult<()> {
+    let db = common::database().await?;
+    let spy = SpyHooks::new(false);
+
+    db.run_with_hooks(&spy, |trx, _| async move {
+        trx.set(b"test_spy_hooks_no_vs", b"value");
+        Ok(())
+    })
+    .await
+    .expect("transaction should succeed");
+
+    assert!(
+        !spy.was_versionstamp_called(),
+        "on_versionstamp should NOT be called when wants_versionstamp() returns false"
+    );
+
+    Ok(())
+}
+
+/// When wants_versionstamp() returns true, on_versionstamp MUST be called for a write transaction.
+async fn test_versionstamp_resolved_when_wanted() -> FdbResult<()> {
+    let db = common::database().await?;
+    let spy = SpyHooks::new(true);
+
+    db.run_with_hooks(&spy, |trx, _| async move {
+        trx.set(b"test_spy_hooks_with_vs", b"value");
+        Ok(())
+    })
+    .await
+    .expect("transaction should succeed");
+
+    assert!(
+        spy.was_versionstamp_called(),
+        "on_versionstamp MUST be called when wants_versionstamp() returns true"
+    );
 
     Ok(())
 }
